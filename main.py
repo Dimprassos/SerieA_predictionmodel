@@ -2,61 +2,49 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import log_loss, accuracy_score
 
-from src.data_processing import load_and_merge_data, train_test_split
+from src.data_processing import load_and_merge_data
 from src.elo import compute_elo_ratings
 from src.poisson_model import (
     fit_team_strengths,
     predict_lambdas,
     apply_elo_to_lambdas,
-    match_outcome_probs,        # plain Poisson for grid search
-    match_outcome_probs_dc,     # Dixon–Coles for final evaluation
-    scoreline_probs_dc,         # needed for fitting rho
+    match_outcome_probs,
+    match_outcome_probs_dc,
+    scoreline_probs_dc,
+    fit_team_strengths_weighted
 )
+from src.calibration import fit_temperature, temperature_scale_probs
+from src.metrics import multiclass_brier, top_label_ece
 
 
-def evaluate_with_elo_params(
-    full_df: pd.DataFrame,
-    split_date: str,
-    K: float,
-    home_adv: float,
-    use_margin: bool,
-    beta: float,
-    window_years: int = 3,
-):
-    """
-    Grid-search objective for Elo params (K, home_adv, use_margin, beta).
-    IMPORTANT: uses plain Poisson outcome probs (NOT Dixon–Coles),
-    because rho is not fitted yet during this stage.
-    """
-    elo_pairs = compute_elo_ratings(full_df, K=K, home_adv=home_adv, use_margin=use_margin)
-    df2 = full_df.copy()
-    df2["elo_home"] = [x[0] for x in elo_pairs]
-    df2["elo_away"] = [x[1] for x in elo_pairs]
-
-    train_full = df2[df2["date"] < split_date]
-    test_full = df2[df2["date"] >= split_date]
-
-    split_dt = pd.to_datetime(split_date)
-    window_start = split_dt - pd.DateOffset(years=window_years)
-    train_recent = train_full[train_full["date"] >= window_start]
-
-    league_avg_home, league_avg_away, attack, defense = fit_team_strengths(train_recent)
-
+# ------------------------------------------------------------
+# Utility: get predictions (raw DC probabilities)
+# ------------------------------------------------------------
+def get_probs(df, league_avg_home, league_avg_away, attack, defense,
+              beta, rho):
     y_true = []
-    y_pred_probs = []
-    y_pred_labels = []
+    probs = []
 
-    for _, row in test_full.iterrows():
+    for _, row in df.iterrows():
         ht, at = row["home_team"], row["away_team"]
 
-        lam_h, lam_a = predict_lambdas(ht, at, league_avg_home, league_avg_away, attack, defense)
-        lam_h, lam_a = apply_elo_to_lambdas(lam_h, lam_a, row["elo_home"], row["elo_away"], beta=beta)
+        lam_h, lam_a = predict_lambdas(
+            ht, at,
+            league_avg_home, league_avg_away,
+            attack, defense
+        )
 
-        # Poisson (no DC here!)
-        pH, pD, pA = match_outcome_probs(lam_h, lam_a)
+        lam_h, lam_a = apply_elo_to_lambdas(
+            lam_h, lam_a,
+            row["elo_home"], row["elo_away"],
+            beta=beta
+        )
 
-        y_pred_probs.append([pH, pD, pA])
-        y_pred_labels.append(int(np.argmax([pH, pD, pA])))
+        pH, pD, pA = match_outcome_probs_dc(
+            lam_h, lam_a, rho=rho, max_goals=10
+        )
+
+        probs.append([pH, pD, pA])
 
         if row["home_goals"] > row["away_goals"]:
             y_true.append(0)
@@ -65,30 +53,18 @@ def evaluate_with_elo_params(
         else:
             y_true.append(2)
 
-    y_pred_probs = np.array(y_pred_probs)
-    ll = log_loss(y_true, y_pred_probs)
-    acc = accuracy_score(y_true, y_pred_labels)
-    return ll, acc
+    return np.array(probs), np.array(y_true)
 
 
-def fit_rho_dc(
-    train_df: pd.DataFrame,
-    league_avg_home: float,
-    league_avg_away: float,
-    attack: dict,
-    defense: dict,
-    K: float,
-    home_adv: float,
-    use_margin: bool,
-    beta: float,
-    max_goals: int = 10,
-):
-    """
-    Fit Dixon–Coles rho by grid-search on TRAIN data only.
-    Uses the chosen Elo params + beta + Poisson strengths.
-    """
-    # Elo pre-match ratings within train_df (chronological)
-    elo_pairs = compute_elo_ratings(train_df, K=K, home_adv=home_adv, use_margin=use_margin)
+# ------------------------------------------------------------
+# Fit rho on train_fit
+# ------------------------------------------------------------
+def fit_rho(train_df, league_avg_home, league_avg_away,
+            attack, defense, K, home_adv, use_margin, beta):
+
+    elo_pairs = compute_elo_ratings(
+        train_df, K=K, home_adv=home_adv, use_margin=use_margin
+    )
     tmp = train_df.copy()
     tmp["elo_home"] = [x[0] for x in elo_pairs]
     tmp["elo_away"] = [x[1] for x in elo_pairs]
@@ -104,18 +80,24 @@ def fit_rho_dc(
         for _, row in tmp.iterrows():
             ht, at = row["home_team"], row["away_team"]
 
-            lam_h, lam_a = predict_lambdas(ht, at, league_avg_home, league_avg_away, attack, defense)
-            lam_h, lam_a = apply_elo_to_lambdas(lam_h, lam_a, row["elo_home"], row["elo_away"], beta=beta)
+            lam_h, lam_a = predict_lambdas(
+                ht, at, league_avg_home, league_avg_away, attack, defense
+            )
 
+            lam_h, lam_a = apply_elo_to_lambdas(
+                lam_h, lam_a,
+                row["elo_home"], row["elo_away"],
+                beta=beta
+            )
+
+            P = scoreline_probs_dc(lam_h, lam_a, rho, max_goals=10)
             hg = int(row["home_goals"])
             ag = int(row["away_goals"])
 
-            P = scoreline_probs_dc(lam_h, lam_a, rho, max_goals=max_goals)
-
-            if hg <= max_goals and ag <= max_goals:
+            if hg <= 10 and ag <= 10:
                 p = P[hg][ag]
             else:
-                p = 1e-12  # out of truncation grid
+                p = 1e-12
 
             if p <= 0:
                 ok = False
@@ -127,154 +109,155 @@ def fit_rho_dc(
             best_nll = nll
             best_rho = float(rho)
 
-    return best_rho, best_nll
+    return best_rho
 
 
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
 def main():
+
     df = load_and_merge_data()
-    train, test = train_test_split(df)
+    df = df.sort_values("date")
 
-    print("Total matches:", len(df))
-    print("Train matches:", len(train))
-    print("Test matches:", len(test))
+    # SPLITS
+    train_fit = df[df["date"] < "2022-07-01"]
+    val = df[(df["date"] >= "2022-07-01") & (df["date"] < "2023-07-01")]
+    test = df[df["date"] >= "2023-07-01"]
 
-    avg_home = train["home_goals"].mean()
-    avg_away = train["away_goals"].mean()
-    print("Average home goals:", round(avg_home, 3))
-    print("Average away goals:", round(avg_away, 3))
-    print("Home advantage:", round(avg_home - avg_away, 3))
+    print("Train_fit:", len(train_fit))
+    print("Validation:", len(val))
+    print("Test:", len(test))
 
-    full_df = df.copy()
-    split_date = "2023-07-01"
-    window_years = 3
+    # Grid search Elo on validation (Poisson only)
+    Ks = [40, 50, 60, 70]
+    home_advs = [60, 80, 100, 110]
+    betas = [0.10, 0.11, 0.12, 0.13]
+    decays = [0.0005, 0.001, 0.0015, 0.002, 0.003]
 
-    # -------------------------
-    # Elo grid search (Poisson outcome probs)
-    # -------------------------
-    print("\n--- Elo Grid Search (recent-window strengths) ---")
-
-    Ks = list(range(35, 71, 5))                 # 35..70 step 5
-    home_advs = list(range(50, 111, 10))        # 50..110 step 10
-    betas = [round(x, 2) for x in np.arange(0.08, 0.141, 0.01)]  # 0.08..0.14
-    use_margins = [True]
-
-    best_ll = None   # (ll, acc, K, ha, um, beta)
-    best_acc = None  # (ll, acc, K, ha, um, beta)
+    best = None  # (logloss, K, ha, beta)
 
     for K in Ks:
         for ha in home_advs:
-            for um in use_margins:
-                for b in betas:
-                    ll, acc = evaluate_with_elo_params(
-                        full_df, split_date, K, ha, um, b, window_years=window_years
+            for beta in betas:
+
+                elo_pairs = compute_elo_ratings(
+                    train_fit, K=K, home_adv=ha, use_margin=True
+                )
+                tmp = train_fit.copy()
+                tmp["elo_home"] = [x[0] for x in elo_pairs]
+                tmp["elo_away"] = [x[1] for x in elo_pairs]
+
+                league_avg_home, league_avg_away, attack, defense = \
+                    fit_team_strengths(tmp)
+
+                # compute val Elo chronologically
+                full_tmp = pd.concat([tmp, val]).sort_values("date")
+                elo_pairs_full = compute_elo_ratings(
+                    full_tmp, K=K, home_adv=ha, use_margin=True
+                )
+                full_tmp["elo_home"] = [x[0] for x in elo_pairs_full]
+                full_tmp["elo_away"] = [x[1] for x in elo_pairs_full]
+
+                val_part = full_tmp.loc[val.index]
+
+                probs = []
+                y_val = []
+
+                for _, row in val_part.iterrows():
+                    lam_h, lam_a = predict_lambdas(
+                        row["home_team"], row["away_team"],
+                        league_avg_home, league_avg_away,
+                        attack, defense
                     )
-                    if (best_ll is None) or (ll < best_ll[0]):
-                        best_ll = (ll, acc, K, ha, um, b)
-                    if (best_acc is None) or (acc > best_acc[1]):
-                        best_acc = (ll, acc, K, ha, um, b)
 
-    # window stats
-    train_full_for_print = full_df[full_df["date"] < split_date]
-    split_dt = pd.to_datetime(split_date)
-    window_start = split_dt - pd.DateOffset(years=window_years)
-    train_recent_for_print = train_full_for_print[train_full_for_print["date"] >= window_start]
+                    lam_h, lam_a = apply_elo_to_lambdas(
+                        lam_h, lam_a,
+                        row["elo_home"], row["elo_away"],
+                        beta=beta
+                    )
 
-    print("\nRecent window training:")
-    print("Window start:", window_start.date())
-    print("Train_full:", len(train_full_for_print), "Train_recent:", len(train_recent_for_print))
+                    pH, pD, pA = match_outcome_probs(lam_h, lam_a)
+                    probs.append([pH, pD, pA])
 
-    print("\nBest by LogLoss:")
-    print("  LogLoss:", round(best_ll[0], 4), "Accuracy:", round(best_ll[1], 4))
-    print("  K:", best_ll[2], "home_adv:", best_ll[3], "use_margin:", best_ll[4], "beta:", best_ll[5])
+                    if row["home_goals"] > row["away_goals"]:
+                        y_val.append(0)
+                    elif row["home_goals"] == row["away_goals"]:
+                        y_val.append(1)
+                    else:
+                        y_val.append(2)
 
-    print("\nBest by Accuracy:")
-    print("  LogLoss:", round(best_acc[0], 4), "Accuracy:", round(best_acc[1], 4))
-    print("  K:", best_acc[2], "home_adv:", best_acc[3], "use_margin:", best_acc[4], "beta:", best_acc[5])
+                probs = np.array(probs)
+                y_val = np.array(y_val)
 
-    # choose final config
-    chosen = best_ll  # change to best_acc if you prefer accuracy
-    chosen_ll, chosen_acc, best_K, best_ha, best_um, best_beta = chosen
+                ll = log_loss(y_val, probs)
 
-    print("\nChosen config:")
-    print("  LogLoss:", round(chosen_ll, 4), "Accuracy:", round(chosen_acc, 4))
-    print("  K:", best_K, "home_adv:", best_ha, "use_margin:", best_um, "beta:", best_beta)
+                if best is None or ll < best[0]:
+                    best = (ll, K, ha, beta)
 
-    # -------------------------
-    # Build df with chosen Elo
-    # -------------------------
-    elo_pairs = compute_elo_ratings(full_df, K=best_K, home_adv=best_ha, use_margin=best_um)
-    full_df["elo_home"] = [x[0] for x in elo_pairs]
-    full_df["elo_away"] = [x[1] for x in elo_pairs]
+    best_ll, best_K, best_ha, best_beta = best
 
-    train_full = full_df[full_df["date"] < split_date]
-    test_full = full_df[full_df["date"] >= split_date]
+    print("\nBest config (VAL LogLoss):")
+    print("LogLoss:", round(best_ll, 4))
+    print("K:", best_K, "home_adv:", best_ha, "beta:", best_beta)
 
-    split_dt = pd.to_datetime(split_date)
-    window_start = split_dt - pd.DateOffset(years=window_years)
-    train_recent = train_full[train_full["date"] >= window_start]
-
-    # strengths on recent window
-    league_avg_home, league_avg_away, attack, defense = fit_team_strengths(train_recent)
-
-    # -------------------------
-    # Fit Dixon–Coles rho on TRAIN ONLY
-    # -------------------------
-    rho, rho_nll = fit_rho_dc(
-        train_recent,
-        league_avg_home, league_avg_away, attack, defense,
-        K=best_K, home_adv=best_ha, use_margin=best_um, beta=best_beta,
-        max_goals=10
+    # Build full Elo on train_fit + val + test
+    elo_pairs_all = compute_elo_ratings(
+        df, K=best_K, home_adv=best_ha, use_margin=True
     )
-    print("\nFitted Dixon-Coles rho:", round(rho, 3))
+    df["elo_home"] = [x[0] for x in elo_pairs_all]
+    df["elo_away"] = [x[1] for x in elo_pairs_all]
 
-    # -------------------------
-    # Final evaluation on test (WITH Dixon–Coles)
-    # -------------------------
-    y_true = []
-    y_pred_probs = []
-    y_pred_labels = []
+    train_fit = df[df["date"] < "2022-07-01"]
+    val = df[(df["date"] >= "2022-07-01") & (df["date"] < "2023-07-01")]
+    test = df[df["date"] >= "2023-07-01"]
 
-    for _, row in test_full.iterrows():
-        ht, at = row["home_team"], row["away_team"]
+    # Fit strengths on train_fit
+    league_avg_home, league_avg_away, attack, defense = \
+    fit_team_strengths_weighted(train_fit, decay=0.0015)
 
-        lam_h, lam_a = predict_lambdas(ht, at, league_avg_home, league_avg_away, attack, defense)
-        lam_h, lam_a = apply_elo_to_lambdas(lam_h, lam_a, row["elo_home"], row["elo_away"], beta=best_beta)
+    # Fit rho on train_fit
+    rho = fit_rho(
+        train_fit,
+        league_avg_home, league_avg_away,
+        attack, defense,
+        best_K, best_ha, True, best_beta
+    )
 
-        pH, pD, pA = match_outcome_probs_dc(lam_h, lam_a, rho=rho, max_goals=10)
+    print("Fitted rho:", round(rho, 3))
 
-        y_pred_probs.append([pH, pD, pA])
-        y_pred_labels.append(int(np.argmax([pH, pD, pA])))
+    # Raw probs
+    val_probs_raw, y_val = get_probs(
+        val, league_avg_home, league_avg_away,
+        attack, defense,
+        best_beta, rho
+    )
 
-        if row["home_goals"] > row["away_goals"]:
-            y_true.append(0)
-        elif row["home_goals"] == row["away_goals"]:
-            y_true.append(1)
-        else:
-            y_true.append(2)
+    test_probs_raw, y_test = get_probs(
+        test, league_avg_home, league_avg_away,
+        attack, defense,
+        best_beta, rho
+    )
 
-    y_pred_probs = np.array(y_pred_probs)
-    ll = log_loss(y_true, y_pred_probs)
-    acc = accuracy_score(y_true, y_pred_labels)
+    # Fit temperature on validation
+    T = fit_temperature(val_probs_raw, y_val)
+    print("Fitted temperature:", round(T, 3))
 
-    print("\n--- Final Test Evaluation (CHOSEN + Dixon-Coles) ---")
-    print("Log Loss:", round(ll, 4))
-    print("Accuracy:", round(acc, 4))
+    test_probs_cal = temperature_scale_probs(test_probs_raw, T)
 
-    # Demo match
-    demo = test_full.iloc[0]
-    ht, at = demo["home_team"], demo["away_team"]
-    lam_h, lam_a = predict_lambdas(ht, at, league_avg_home, league_avg_away, attack, defense)
-    lam_h, lam_a = apply_elo_to_lambdas(lam_h, lam_a, demo["elo_home"], demo["elo_away"], beta=best_beta)
-    pH, pD, pA = match_outcome_probs_dc(lam_h, lam_a, rho=rho, max_goals=10)
+    # Metrics
+    print("\n--- TEST METRICS ---")
 
-    print("\nExample match:", ht, "vs", at)
-    print("Lambdas:", round(lam_h, 3), round(lam_a, 3))
-    print("1X2 probs:", round(pH, 3), round(pD, 3), round(pA, 3))
-    print("Actual score:", int(demo["home_goals"]), "-", int(demo["away_goals"]))
+    print("\nRaw:")
+    print("LogLoss:", round(log_loss(y_test, test_probs_raw), 4))
+    print("Brier:", round(multiclass_brier(test_probs_raw, y_test), 4))
+    print("ECE:", round(top_label_ece(test_probs_raw, y_test), 4))
 
-    last_date = full_df["date"].max()
-    print("\nData last date:", last_date)
+    print("\nCalibrated:")
+    print("LogLoss:", round(log_loss(y_test, test_probs_cal), 4))
+    print("Brier:", round(multiclass_brier(test_probs_cal, y_test), 4))
+    print("ECE:", round(top_label_ece(test_probs_cal, y_test), 4))
 
-    print("new feature")
+
 if __name__ == "__main__":
     main()

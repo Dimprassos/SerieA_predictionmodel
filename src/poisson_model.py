@@ -234,3 +234,55 @@ def match_outcome_probs(lam_h: float, lam_a: float, max_goals: int = 10):
     if s > 0:
         pH, pD, pA = pH / s, pD / s, pA / s
     return pH, pD, pA
+
+def fit_team_strengths_weighted(df: pd.DataFrame, decay: float = 0.0015):
+    """
+    Recency-weighted Poisson team strength estimation.
+    decay: exponential time decay parameter (per day)
+    """
+
+    df = df.copy()
+    df = df.sort_values("date")
+
+    max_date = df["date"].max()
+
+    # compute time difference in days
+    df["days_ago"] = (max_date - df["date"]).dt.days
+
+    # exponential weights
+    df["weight"] = np.exp(-decay * df["days_ago"])
+
+    teams = pd.concat([df["home_team"], df["away_team"]]).unique()
+
+    attack = {team: 1.0 for team in teams}
+    defense = {team: 1.0 for team in teams}
+
+    league_avg_home = np.average(df["home_goals"], weights=df["weight"])
+    league_avg_away = np.average(df["away_goals"], weights=df["weight"])
+
+    for _ in range(50):  # iterative updates
+        for team in teams:
+            home_mask = df["home_team"] == team
+            away_mask = df["away_team"] == team
+
+            # weighted attack
+            num = np.sum(df.loc[home_mask, "weight"] * df.loc[home_mask, "home_goals"])
+            den = np.sum(
+                df.loc[home_mask, "weight"]
+                * league_avg_home
+                * np.array([defense[opp] for opp in df.loc[home_mask, "away_team"]])
+            )
+            if den > 0:
+                attack[team] = num / den
+
+            # weighted defense
+            num = np.sum(df.loc[away_mask, "weight"] * df.loc[away_mask, "home_goals"])
+            den = np.sum(
+                df.loc[away_mask, "weight"]
+                * league_avg_home
+                * np.array([attack[opp] for opp in df.loc[away_mask, "home_team"]])
+            )
+            if den > 0:
+                defense[team] = num / den
+
+    return league_avg_home, league_avg_away, attack, defense
