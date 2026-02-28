@@ -234,3 +234,6 @@ def match_outcome_probs(lam_h: float, lam_a: float, max_goals: int = 10):
     if s > 0:
         pH, pD, pA = pH / s, pD / s, pA / s
     return pH, pD, pA
+
+def new():
+    return 1
