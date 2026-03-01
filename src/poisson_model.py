@@ -260,7 +260,7 @@ def fit_team_strengths_weighted(df: pd.DataFrame, decay: float = 0.0015):
     league_avg_home = np.average(df["home_goals"], weights=df["weight"])
     league_avg_away = np.average(df["away_goals"], weights=df["weight"])
 
-    for _ in range(50):  # iterative updates
+    for _ in range(10):  # iterative updates
         for team in teams:
             home_mask = df["home_team"] == team
             away_mask = df["away_team"] == team
@@ -286,3 +286,76 @@ def fit_team_strengths_weighted(df: pd.DataFrame, decay: float = 0.0015):
                 defense[team] = num / den
 
     return league_avg_home, league_avg_away, attack, defense
+
+def fit_team_strengths_home_away_weighted(df: pd.DataFrame, decay: float = 0.001):
+    """
+    Weighted strengths αλλά με 4 vectors:
+    - attack_home[team], defense_home[team]
+    - attack_away[team], defense_away[team]
+    """
+    df = df.copy()
+    df = df.sort_values("date")
+
+    last_date = df["date"].max()
+    df["days_ago"] = (last_date - df["date"]).dt.days.astype(float)
+    df["weight"] = np.exp(-decay * df["days_ago"])
+
+    teams = pd.Index(sorted(set(df["home_team"]).union(set(df["away_team"]))))
+
+    # Weighted league averages
+    w_sum = df["weight"].sum()
+    league_avg_home = (df["weight"] * df["home_goals"]).sum() / w_sum
+    league_avg_away = (df["weight"] * df["away_goals"]).sum() / w_sum
+
+    # Weighted aggregates per team
+    home_for = (df["weight"] * df["home_goals"]).groupby(df["home_team"]).sum().reindex(teams, fill_value=0.0)
+    home_against = (df["weight"] * df["away_goals"]).groupby(df["home_team"]).sum().reindex(teams, fill_value=0.0)
+    home_w = df["weight"].groupby(df["home_team"]).sum().reindex(teams, fill_value=0.0)
+
+    away_for = (df["weight"] * df["away_goals"]).groupby(df["away_team"]).sum().reindex(teams, fill_value=0.0)
+    away_against = (df["weight"] * df["home_goals"]).groupby(df["away_team"]).sum().reindex(teams, fill_value=0.0)
+    away_w = df["weight"].groupby(df["away_team"]).sum().reindex(teams, fill_value=0.0)
+
+    eps = 1e-9
+
+    # Expected goals given league avg & match weights
+    exp_home_for = league_avg_home * home_w
+    exp_home_against = league_avg_away * home_w
+
+    exp_away_for = league_avg_away * away_w
+    exp_away_against = league_avg_home * away_w
+
+    attack_home = (home_for + eps) / (exp_home_for + eps)
+    defense_home = (home_against + eps) / (exp_home_against + eps)
+
+    attack_away = (away_for + eps) / (exp_away_for + eps)
+    defense_away = (away_against + eps) / (exp_away_against + eps)
+
+    # Optional: clamp to avoid extreme lambdas early-season
+    def _clip(s):
+        return s.clip(lower=0.3, upper=3.0)
+
+    return (
+        float(league_avg_home), float(league_avg_away),
+        _clip(attack_home).to_dict(), _clip(defense_home).to_dict(),
+        _clip(attack_away).to_dict(), _clip(defense_away).to_dict()
+    )
+
+
+def predict_lambdas_home_away(
+    home_team: str, away_team: str,
+    league_avg_home: float, league_avg_away: float,
+    attack_home: dict, defense_home: dict,
+    attack_away: dict, defense_away: dict,
+):
+    ah = attack_home.get(home_team, 1.0)
+    dh = defense_home.get(home_team, 1.0)
+    aa = attack_away.get(away_team, 1.0)
+    da = defense_away.get(away_team, 1.0)
+
+    lam_h = league_avg_home * ah * da
+    lam_a = league_avg_away * aa * dh
+
+    lam_h = max(0.05, float(lam_h))
+    lam_a = max(0.05, float(lam_a))
+    return lam_h, lam_a
