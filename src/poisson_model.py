@@ -177,32 +177,29 @@ def fit_team_strengths_home_away(train: pd.DataFrame, eps: float = 1e-6):
     return league_avg_home, league_avg_away, attack_home, defense_home, attack_away, defense_away
 
 
-def predict_lambdas_home_away(
-    home_team: str,
-    away_team: str,
-    league_avg_home: float,
-    league_avg_away: float,
-    attack_home: dict,
-    defense_home: dict,
-    attack_away: dict,
-    defense_away: dict,
-):
-    ah = attack_home.get(home_team, 1.0)
-    dh = defense_home.get(home_team, 1.0)
-    aa = attack_away.get(away_team, 1.0)
-    da = defense_away.get(away_team, 1.0)
-
-    lam_home = league_avg_home * ah * da
-    lam_away = league_avg_away * aa * dh
-    return lam_home, lam_away
-
-
-
 def dixon_coles_tau(hg: int, ag: int, lam_h: float, lam_a: float, rho: float) -> float:
     """
     Dixon–Coles correction factor tau for low-score dependence.
-    Only affects (0,0), (0,1), (1,0), (1,1).
+    Only affects scorelines (0,0), (0,1), (1,0), (1,1).
+
+    The tau(0,0) term equals 1 - lam_h * lam_a * rho. If rho is too large
+    relative to lam_h and lam_a this becomes negative, producing an invalid
+    (negative) joint probability. We therefore clamp rho to a safe maximum
+    before applying each formula, ensuring all tau values stay positive.
+
+    Safe upper bound derivation:
+      tau(0,0) >= eps  =>  rho <= (1 - eps) / (lam_h * lam_a)
+      tau(1,1) >= eps  =>  rho <= 1 - eps
+    We take the stricter of the two.
     """
+    eps = 1e-6
+    denom = lam_h * lam_a
+    if denom > 0:
+        rho_max = min((1.0 - eps) / denom, 1.0 - eps)
+    else:
+        rho_max = 1.0 - eps
+    rho = max(-rho_max, min(rho, rho_max))   # also handles negative rho
+
     if hg == 0 and ag == 0:
         return 1.0 - (lam_h * lam_a * rho)
     if hg == 0 and ag == 1:

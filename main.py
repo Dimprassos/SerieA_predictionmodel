@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from sklearn.metrics import log_loss
@@ -19,29 +22,62 @@ from src.calibration import fit_temperature, temperature_scale_probs
 from src.metrics import multiclass_brier, top_label_ece
 
 
-import json
-from pathlib import Path
-
-USE_CACHED_PARAMS = True
-FORCE_RETUNE = False
+# ============================================================
+# CONFIG
+# ============================================================
 EXPERIMENT_NAME = "baseline_xgboost_v1"
 
-PARAMS_FILE = Path("artifacts") / f"best_params_{EXPERIMENT_NAME}.json"
+USE_CACHED_ARTIFACTS = True
+FORCE_RETUNE_LEAGUES = True     # ξαναβρίσκει K, ha, beta, decay, rho, T
+FORCE_RETUNE_META = True        # ξαναβρίσκει XGBoost hyperparams
+FORCE_REFIT_META_MODEL = True   # ξανακάνει fit το τελικό meta model
+
+TRAIN_CUT = "2024-07-01"
+TEST_CUT = "2025-07-01"
+
+LEAGUES = ["england", "spain", "italy", "germany", "france"]
+
+ARTIFACTS_DIR = Path("artifacts")
+PARAMS_FILE = ARTIFACTS_DIR / f"best_params_{EXPERIMENT_NAME}.json"
+META_FILE = ARTIFACTS_DIR / f"best_meta_{EXPERIMENT_NAME}.json"
+MODEL_FILE = ARTIFACTS_DIR / f"meta_model_{EXPERIMENT_NAME}.json"
 
 
-def load_cached_params():
-    if PARAMS_FILE.exists():
-        with open(PARAMS_FILE, "r", encoding="utf-8") as f:
+# ============================================================
+# JSON helpers
+# ============================================================
+def load_json_if_exists(path: Path):
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return None
 
 
+def save_json(path: Path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+
+
+def load_cached_params():
+    return load_json_if_exists(PARAMS_FILE)
+
+
 def save_cached_params(params):
-    PARAMS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(PARAMS_FILE, "w", encoding="utf-8") as f:
-        json.dump(params, f, indent=2)
+    save_json(PARAMS_FILE, params)
 
 
+def load_cached_meta():
+    return load_json_if_exists(META_FILE)
+
+
+def save_cached_meta(meta_params):
+    save_json(META_FILE, meta_params)
+
+
+# ============================================================
+# Market implied probabilities
+# ============================================================
 def market_probs_from_odds_row(odds_h, odds_d, odds_a):
     if not (np.isfinite(odds_h) and np.isfinite(odds_d) and np.isfinite(odds_a)):
         return np.array([np.nan, np.nan, np.nan], dtype=float)
@@ -74,6 +110,9 @@ def labels_from_df(df: pd.DataFrame) -> np.ndarray:
     return np.array(y, dtype=int)
 
 
+# ============================================================
+# Streaming block-walk-forward
+# ============================================================
 def streaming_block_probs_home_away(
     predict_df,
     full_df,
@@ -277,10 +316,7 @@ def simulate_value_betting(probs, raw_odds, y_true, edge_threshold=0.05):
     return total_bets, total_wins, final_profit, final_roi, avg_odds
 
 
-def get_current_or_next_matchday_fixtures(
-    df_league: pd.DataFrame,
-    max_window_days: int = 4,
-):
+def get_current_or_next_matchday_fixtures(df_league: pd.DataFrame, max_window_days: int = 4):
     today = pd.Timestamp.now().normalize()
 
     future_df = df_league[df_league["is_played"] == False].copy()
@@ -308,6 +344,9 @@ def get_current_or_next_matchday_fixtures(
     return fixtures, matchday_start
 
 
+# ============================================================
+# Per-league tuning
+# ============================================================
 def tune_league_params(train_fit, val, full_played_df):
     Ks = [40, 50, 60, 70]
     home_advs = [60, 80, 100, 110]
@@ -365,14 +404,17 @@ def tune_league_params(train_fit, val, full_played_df):
     print("--- Tuning Time Decay ---")
     best_decay = None
     best_decay_ll = float("inf")
-
     y_val = labels_from_df(val)
 
-    elo_full = compute_elo_ratings(full_played_df[full_played_df["date"] < val["date"].max() + pd.Timedelta(days=1)],
-                                   K=best_K, home_adv=best_ha, use_margin=True)
+    elo_full = compute_elo_ratings(
+        full_played_df[full_played_df["date"] < val["date"].max() + pd.Timedelta(days=1)],
+        K=best_K, home_adv=best_ha, use_margin=True
+    )
     tmp_df = full_played_df[full_played_df["date"] < val["date"].max() + pd.Timedelta(days=1)].copy()
     tmp_df["elo_home"], tmp_df["elo_away"] = zip(*elo_full)
     val_part = tmp_df[tmp_df["date"].isin(val["date"])].copy()
+
+    from src.poisson_model import predict_lambdas
 
     for d in decays:
         l_avg_h, l_avg_a, att, dfn = fit_team_strengths_weighted(train_fit, decay=d)
@@ -426,22 +468,30 @@ def tune_league_params(train_fit, val, full_played_df):
     }
 
 
+# ============================================================
+# Main
+# ============================================================
 def main():
-    leagues = ["england", "spain", "italy", "germany", "france"]
-
-    TRAIN_CUT = "2024-07-01"
-    TEST_CUT = "2025-07-01"
-
-    cached_params = load_cached_params() if USE_CACHED_PARAMS and not FORCE_RETUNE else None
-    league_best_params = {} if cached_params is None else cached_params
+    cached_params = load_cached_params() if USE_CACHED_ARTIFACTS and not FORCE_RETUNE_LEAGUES else None
+    cached_meta = load_cached_meta() if USE_CACHED_ARTIFACTS and not FORCE_RETUNE_META else None
 
     if cached_params is not None:
-        print(f"\nUsing cached parameters from: {PARAMS_FILE}")
+        print(f"\nUsing cached league params from: {PARAMS_FILE}")
     else:
-        if FORCE_RETUNE:
-            print(f"\nFORCE_RETUNE=True -> ignoring cache and running tuning again.")
+        if FORCE_RETUNE_LEAGUES:
+            print("\nFORCE_RETUNE_LEAGUES=True -> retuning league params.")
         else:
-            print(f"\nNo cached parameters found for experiment: {EXPERIMENT_NAME}")
+            print(f"\nNo cached league params found for experiment: {EXPERIMENT_NAME}")
+
+    if cached_meta is not None:
+        print(f"Using cached XGBoost hyperparams from: {META_FILE}")
+    else:
+        if FORCE_RETUNE_META:
+            print("FORCE_RETUNE_META=True -> retuning XGBoost hyperparams.")
+        else:
+            print(f"No cached XGBoost hyperparams found for experiment: {EXPERIMENT_NAME}")
+
+    league_best_params = {} if cached_params is None else cached_params
 
     all_X_early, all_y_early = [], []
     all_X_late, all_y_late = [], []
@@ -452,7 +502,10 @@ def main():
     all_t_mkt_fixed = []
     all_t_raw_odds = []
 
-    for league in leagues:
+    # Per-league test data for individual reporting
+    per_league_test = {}  # league -> {"y": [], "p_model": [], "p_mkt": []}
+
+    for league in LEAGUES:
         print("\n" + "=" * 50)
         print(f"=== Processing Data: {league.upper()} ===")
         print("=" * 50)
@@ -474,7 +527,7 @@ def main():
             print(f"Μη επαρκή splits για {league}.")
             continue
 
-        if league in league_best_params:
+        if league in league_best_params and not FORCE_RETUNE_LEAGUES:
             params = league_best_params[league]
             print("\n--- Using cached params ---")
             print(
@@ -543,9 +596,16 @@ def main():
         all_t_mkt_fixed.extend(t_mkt_fixed)
         all_t_raw_odds.extend(test[["odds_home", "odds_draw", "odds_away"]].values)
 
-    if cached_params is None:
+        # Save per-league test data for individual metric reporting
+        per_league_test[league] = {
+            "y":       np.array(t_y, dtype=int),
+            "p_model": np.array(t_probs_model, dtype=float),
+            "p_mkt":   np.array(t_mkt_fixed, dtype=float),
+        }
+
+    if cached_params is None or FORCE_RETUNE_LEAGUES:
         save_cached_params(league_best_params)
-        print(f"\nSaved tuned parameters to: {PARAMS_FILE}")
+        print(f"\nSaved tuned league params to: {PARAMS_FILE}")
 
     print("\n" + "=" * 50)
     print("=== META-MODEL Evaluation (XGBoost) ===")
@@ -567,42 +627,83 @@ def main():
     max_depths = [3, 4, 5]
     n_estimators_list = [100, 300, 500]
 
-    best_meta = None
+    if cached_meta is not None and not FORCE_RETUNE_META:
+        best_lr = cached_meta["learning_rate"]
+        best_md = cached_meta["max_depth"]
+        best_ne = cached_meta["n_estimators"]
+        best_late_ll = cached_meta.get("late_val_logloss", None)
 
-    print("Tuning XGBoost Hyperparameters on Validation Set. Please wait...")
-    for lr in learning_rates:
-        for md in max_depths:
-            for ne in n_estimators_list:
-                meta = XGBClassifier(
-                    n_estimators=ne,
-                    learning_rate=lr,
-                    max_depth=md,
-                    objective="multi:softprob",
-                    eval_metric="mlogloss",
-                    random_state=42,
-                    n_jobs=-1,
-                )
-                meta.fit(X_early_arr, y_early_arr)
-                late_probs = meta.predict_proba(X_late_arr)
-                late_ll = log_loss(y_late_arr, late_probs)
+        print("Using cached XGBoost hyperparameters...")
+        print(f"Best XGBoost Config -> LR: {best_lr}, Depth: {best_md}, Trees: {best_ne}")
+        if best_late_ll is not None:
+            print(f"Cached Late VAL LogLoss: {round(best_late_ll, 4)}")
+    else:
+        best_meta = None
 
-                if best_meta is None or late_ll < best_meta[0]:
-                    best_meta = (late_ll, lr, md, ne)
+        print("Tuning XGBoost Hyperparameters on Validation Set. Please wait...")
+        for lr in learning_rates:
+            for md in max_depths:
+                for ne in n_estimators_list:
+                    meta = XGBClassifier(
+                        n_estimators=ne,
+                        learning_rate=lr,
+                        max_depth=md,
+                        objective="multi:softprob",
+                        eval_metric="mlogloss",
+                        random_state=42,
+                        n_jobs=-1,
+                    )
+                    meta.fit(X_early_arr, y_early_arr)
+                    late_probs = meta.predict_proba(X_late_arr)
+                    late_ll = log_loss(y_late_arr, late_probs)
 
-    best_late_ll, best_lr, best_md, best_ne = best_meta
-    print(f"Best XGBoost Config -> LR: {best_lr}, Depth: {best_md}, Trees: {best_ne}")
-    print(f"Late VAL LogLoss: {round(best_late_ll, 4)}")
+                    if best_meta is None or late_ll < best_meta[0]:
+                        best_meta = (late_ll, lr, md, ne)
 
-    meta_final = XGBClassifier(
-        n_estimators=best_ne,
-        learning_rate=best_lr,
-        max_depth=best_md,
-        objective="multi:softprob",
-        eval_metric="mlogloss",
-        random_state=42,
-        n_jobs=-1,
+        best_late_ll, best_lr, best_md, best_ne = best_meta
+
+        print(f"Best XGBoost Config -> LR: {best_lr}, Depth: {best_md}, Trees: {best_ne}")
+        print(f"Late VAL LogLoss: {round(best_late_ll, 4)}")
+
+        save_cached_meta({
+            "learning_rate": float(best_lr),
+            "max_depth": int(best_md),
+            "n_estimators": int(best_ne),
+            "late_val_logloss": float(best_late_ll),
+        })
+        print(f"Saved XGBoost hyperparams to: {META_FILE}")
+
+    can_load_model = (
+        USE_CACHED_ARTIFACTS
+        and MODEL_FILE.exists()
+        and not FORCE_RETUNE_META
+        and not FORCE_REFIT_META_MODEL
     )
-    meta_final.fit(X_val_arr, y_val_arr)
+
+    if can_load_model:
+        print(f"Loading trained XGBoost meta-model from: {MODEL_FILE}")
+        meta_final = XGBClassifier(
+            objective="multi:softprob",
+            eval_metric="mlogloss",
+            random_state=42,
+            n_jobs=-1,
+        )
+        meta_final.load_model(str(MODEL_FILE))
+    else:
+        print("Fitting final XGBoost meta-model...")
+        meta_final = XGBClassifier(
+            n_estimators=best_ne,
+            learning_rate=best_lr,
+            max_depth=best_md,
+            objective="multi:softprob",
+            eval_metric="mlogloss",
+            random_state=42,
+            n_jobs=-1,
+        )
+        meta_final.fit(X_val_arr, y_val_arr)
+        MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        meta_final.save_model(str(MODEL_FILE))
+        print(f"Saved trained XGBoost meta-model to: {MODEL_FILE}")
 
     print("\n--- Final Test Evaluation ---")
     t_probs_meta = meta_final.predict_proba(X_test_arr)
@@ -616,6 +717,56 @@ def main():
     report("BASE (Model only, calibrated)", t_probs_model_arr)
     report("MARKET (odds implied)", t_mkt_fixed_arr)
     report("META (Market + Model)", t_probs_meta)
+
+    # ── Per-league breakdown ──────────────────────────────────────────────
+    print("\n" + "=" * 65)
+    print("=== PER-LEAGUE TEST METRICS ===")
+    print("=" * 65)
+
+    # Build per-league meta probs by re-running predict_proba on league slice
+    # We reconstruct the league slices from per_league_test + X_test_arr ordering.
+    # Since leagues were appended in LEAGUES order, we can slice X_test_arr.
+    league_slice_start = 0
+    col_w = 10
+
+    header = (
+        f"{'League':<10} | {'N':>4} | "
+        f"{'Base LL':>{col_w}} | {'Base Brier':>{col_w}} | "
+        f"{'Mkt LL':>{col_w}} | "
+        f"{'Meta LL':>{col_w}} | {'Meta Brier':>{col_w}} | {'Meta ECE':>{col_w}}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for league in LEAGUES:
+        if league not in per_league_test:
+            continue
+
+        ld = per_league_test[league]
+        y_l   = ld["y"]
+        pm_l  = ld["p_model"]
+        pmkt_l = ld["p_mkt"]
+        n     = len(y_l)
+
+        # Slice the matching rows from X_test_arr
+        X_l = X_test_arr[league_slice_start: league_slice_start + n]
+        league_slice_start += n
+
+        meta_l = meta_final.predict_proba(X_l)
+
+        base_ll    = round(log_loss(y_l, pm_l),                   4)
+        base_brier = round(multiclass_brier(pm_l, y_l),           4)
+        mkt_ll     = round(log_loss(y_l, pmkt_l),                 4)
+        meta_ll    = round(log_loss(y_l, meta_l),                 4)
+        meta_brier = round(multiclass_brier(meta_l, y_l),         4)
+        meta_ece   = round(top_label_ece(meta_l, y_l),            4)
+
+        print(
+            f"{league.upper():<10} | {n:>4} | "
+            f"{base_ll:>{col_w}} | {base_brier:>{col_w}} | "
+            f"{mkt_ll:>{col_w}} | "
+            f"{meta_ll:>{col_w}} | {meta_brier:>{col_w}} | {meta_ece:>{col_w}}"
+        )
 
     print("\n--- Betting simulation - All Top 5 Leagues ---")
     threshold = 0.05
@@ -638,7 +789,7 @@ def main():
 
     upcoming_rows = []
 
-    for league in leagues:
+    for league in LEAGUES:
         params = league_best_params.get(league)
         if params is None:
             continue
