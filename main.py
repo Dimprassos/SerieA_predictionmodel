@@ -4,6 +4,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.metrics import log_loss
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
 from src.data_processing import load_league_data
@@ -28,9 +31,9 @@ from src.metrics import multiclass_brier, top_label_ece
 EXPERIMENT_NAME = "baseline_xgboost_v1"
 
 USE_CACHED_ARTIFACTS = True
-FORCE_RETUNE_LEAGUES = True     # ξαναβρίσκει K, ha, beta, decay, rho, T
-FORCE_RETUNE_META = True        # ξαναβρίσκει XGBoost hyperparams
-FORCE_REFIT_META_MODEL = True   # ξανακάνει fit το τελικό meta model
+FORCE_RETUNE_LEAGUES = False     # ξαναβρίσκει K, ha, beta, decay, rho, T
+FORCE_RETUNE_META = False        # ξαναβρίσκει XGBoost hyperparams
+FORCE_REFIT_META_MODEL = False   # ξανακάνει fit το τελικό meta model
 
 TRAIN_CUT = "2024-07-01"
 TEST_CUT = "2025-07-01"
@@ -705,8 +708,27 @@ def main():
         meta_final.save_model(str(MODEL_FILE))
         print(f"Saved trained XGBoost meta-model to: {MODEL_FILE}")
 
+    # --- Deep Learning Model (MLP) ---
+    print("Training Deep Learning Baseline (MLP)...")
+    # Τα Νευρωνικά Δίκτυα χρειάζονται scaled features (StandardScaler)
+    mlp_model = make_pipeline(
+        StandardScaler(),
+        MLPClassifier(
+            hidden_layer_sizes=(64, 32),
+            activation="relu",
+            solver="adam",
+            alpha=0.001,
+            max_iter=1000,
+            random_state=42,
+            early_stopping=True,
+            validation_fraction=0.1
+        )
+    )
+    mlp_model.fit(X_val_arr, y_val_arr)
+    
     print("\n--- Final Test Evaluation ---")
     t_probs_meta = meta_final.predict_proba(X_test_arr)
+    t_probs_mlp = mlp_model.predict_proba(X_test_arr)
 
     def report(name, probs):
         print(f"\n{name}:")
@@ -717,6 +739,7 @@ def main():
     report("BASE (Model only, calibrated)", t_probs_model_arr)
     report("MARKET (odds implied)", t_mkt_fixed_arr)
     report("META (Market + Model)", t_probs_meta)
+    report("DEEP LEARNING (MLP)", t_probs_mlp)
 
     # ── Per-league breakdown ──────────────────────────────────────────────
     print("\n" + "=" * 65)
