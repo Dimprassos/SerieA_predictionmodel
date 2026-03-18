@@ -1,6 +1,6 @@
 {
-  "learning_rate": 0.00877767683018055,
+  "learning_rate": 0.008465083219770473,
   "max_depth": 2,
-  "n_estimators": 295,
-  "late_val_logloss": 0.9814412098362668
+  "n_estimators": 352,
+  "late_val_logloss": 0.9815758713586392
 }

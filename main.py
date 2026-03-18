@@ -44,22 +44,18 @@ MLP_META_FILE = ARTIFACTS_DIR / f"best_mlp_{EXPERIMENT_NAME}.json"
 MLP_MODEL_FILE = ARTIFACTS_DIR / f"mlp_model_{EXPERIMENT_NAME}.pkl"
 BLEND_FILE = ARTIFACTS_DIR / f"best_blend_{EXPERIMENT_NAME}.json"
 
-USE_CACHED_ARTIFACTS = True 
-FORCE_RETUNE_LEAGUES = False    # Το αφήνεις False (έχουμε ήδη τέλεια Poisson/Elo params)
-FORCE_RETUNE_META = False        # Ενεργοποιεί το Optuna για το XGBoost
-FORCE_REFIT_META_MODEL = False   # Αναγκάζει το XGBoost να ξαναγίνει fit με τα νέα params
-FORCE_RETUNE_MLP = False         # Ενεργοποιεί το Optuna για το MLP
-FORCE_REFIT_MLP_MODEL = False    # Αναγκάζει το MLP να ξαναγίνει fit με τα νέα params
-FORCE_RETUNE_BLEND = False       # Απαραίτητο True, γιατί αφού άλλαξαν τα μοντέλα, αλλάζουν και τα ιδανικά βάρη
+USE_CACHED_ARTIFACTS = False 
+FORCE_RETUNE_LEAGUES = True    # Το αφήνεις False (έχουμε ήδη τέλεια Poisson/Elo params)
+FORCE_RETUNE_META = True        # Ενεργοποιεί το Optuna για το XGBoost
+FORCE_REFIT_META_MODEL = True   # Αναγκάζει το XGBoost να ξαναγίνει fit με τα νέα params
+FORCE_RETUNE_MLP = True         # Ενεργοποιεί το Optuna για το MLP
+FORCE_REFIT_MLP_MODEL = True    # Αναγκάζει το MLP να ξαναγίνει fit με τα νέα params
+FORCE_RETUNE_BLEND = True       # Απαραίτητο True, γιατί αφού άλλαξαν τα μοντέλα, αλλάζουν και τα ιδανικά βάρη
 
 TRAIN_CUT = "2024-07-01"
 TEST_CUT = "2025-07-01"
 
 LEAGUES = ["england", "spain", "italy", "germany", "france"]
-
-
-
-
 # ============================================================
 # Main
 # ============================================================

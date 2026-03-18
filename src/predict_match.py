@@ -46,7 +46,7 @@ def safe_logit(p, eps=1e-12):
     return np.log(p) - np.log(1 - p)
 
 
-def build_meta_features_single(model_probs, market_probs, elo_h, elo_a, lam_h, lam_a):
+def build_meta_features_single(model_probs, market_probs, elo_h, elo_a, lam_h, lam_a, mom_h, mom_a, mom_diff):
     pm = np.asarray(model_probs, dtype=float)
     pk = np.asarray(market_probs, dtype=float)
     if not np.isfinite(pk).all():
@@ -57,6 +57,9 @@ def build_meta_features_single(model_probs, market_probs, elo_h, elo_a, lam_h, l
         (elo_h - elo_a) / 400.0,
         lam_h + lam_a,
         lam_h - lam_a,
+        mom_h,
+        mom_a,
+        mom_diff
     ]
     return np.array([feats], dtype=float)
 
@@ -87,6 +90,7 @@ def get_league_state(league_name, params):
     )
 
     ratings = {}
+    elo_history = {}
     K = params[league_name]["K"]
     ha = params[league_name]["ha"]
 
@@ -105,14 +109,27 @@ def get_league_state(league_name, params):
             ratings[h] = rh
         if a not in ratings:
             ratings[a] = ra
+        if h not in elo_history:
+            elo_history[h] = []
+        if a not in elo_history:
+            elo_history[a] = []
+
         exp_h = expected_score(rh + ha, ra)
         sh, sa = match_result(hg, ag)
         mult = margin_multiplier(hg - ag)
-        ratings[h] = rh + (K * mult) * (sh - exp_h)
-        ratings[a] = ra + (K * mult) * (sa - (1 - exp_h))
+        
+        new_rh = rh + (K * mult) * (sh - exp_h)
+        new_ra = ra + (K * mult) * (sa - (1 - exp_h))
+        
+        ratings[h] = new_rh
+        ratings[a] = new_ra
+        
+        elo_history[h].append(new_rh)
+        elo_history[a].append(new_ra)
 
     return {
         "ratings": ratings,
+        "elo_history": elo_history,
         "att_h": att_h,
         "def_h": def_h,
         "att_a": att_a,
@@ -127,6 +144,15 @@ def predict_custom_match(home, away, odds_h, odds_d, odds_a, state, meta_model, 
     p = state["params"]
     elo_h = state["ratings"].get(home, 1500.0)
     elo_a = state["ratings"].get(away, 1500.0)
+
+    def get_momentum(team, current_r, history, window=4):
+        if team not in history or len(history[team]) < window:
+            return 0.0
+        return current_r - history[team][-window]
+
+    mom_h = get_momentum(home, elo_h, state["elo_history"], window=4) / 400.0
+    mom_a = get_momentum(away, elo_a, state["elo_history"], window=4) / 400.0
+    mom_diff = mom_h - mom_a
 
     lam_h, lam_a = predict_lambdas_home_away(
         home, away,
@@ -144,7 +170,7 @@ def predict_custom_match(home, away, odds_h, odds_d, odds_a, state, meta_model, 
     else:
         mkt_probs = model_probs_cal
 
-    X = build_meta_features_single(model_probs_cal, mkt_probs, elo_h, elo_a, lam_h, lam_a)
+    X = build_meta_features_single(model_probs_cal, mkt_probs, elo_h, elo_a, lam_h, lam_a, mom_h, mom_a, mom_diff)
     meta_probs = meta_model.predict_proba(X)[0]
 
     if mlp_model is not None:
